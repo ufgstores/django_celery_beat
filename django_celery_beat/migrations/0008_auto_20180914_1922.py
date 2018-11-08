@@ -7,6 +7,7 @@ from django_celery_beat import validators
 
 
 class Migration(migrations.Migration):
+
     dependencies = [
         ('django_celery_beat', '0007_auto_20180521_0826'),
     ]

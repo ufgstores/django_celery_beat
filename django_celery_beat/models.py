@@ -7,7 +7,6 @@ import timezone_field
 from celery import schedules
 from celery.five import python_2_unicode_compatible
 from django.core.exceptions import MultipleObjectsReturned, ValidationError
-from django.core.validators import MaxValueValidator
 from django.db import models
 from django.db.models import signals
 from django.utils.translation import ugettext_lazy as _
@@ -282,10 +281,6 @@ class PeriodicTask(models.Model):
     routing_key = models.CharField(
         _('routing key'), max_length=200, blank=True, null=True, default=None,
     )
-    priority = models.PositiveIntegerField(
-        _('priority'), default=None, validators=[MaxValueValidator(255)],
-        blank=True, null=True
-    )
     expires = models.DateTimeField(
         _('expires'), blank=True, null=True,
     )
@@ -319,24 +314,21 @@ class PeriodicTask(models.Model):
 
     def validate_unique(self, *args, **kwargs):
         super(PeriodicTask, self).validate_unique(*args, **kwargs)
-
-        schedule_types = ['interval', 'crontab', 'solar']
-        selected_schedule_types = [s for s in schedule_types
-                                   if getattr(self, s)]
-
-        if len(selected_schedule_types) == 0:
+        if not self.interval and not self.crontab and not self.solar:
             raise ValidationError({
                 'interval': [
                     'One of interval, crontab, or solar must be set.'
                 ]
             })
-
         err_msg = 'Only one of interval, crontab, or solar must be set'
-        if len(selected_schedule_types) > 1:
-            error_info = {}
-            for selected_schedule_type in selected_schedule_types:
-                error_info[selected_schedule_type] = [err_msg]
-            raise ValidationError(error_info)
+        if (self.interval and self.crontab) or (self.crontab and self.solar):
+            raise ValidationError({
+                'crontab': [err_msg]
+            })
+        if self.interval or self.solar:
+            raise ValidationError({
+                'solar': [err_msg]
+            })
 
     def save(self, *args, **kwargs):
         self.exchange = self.exchange or None

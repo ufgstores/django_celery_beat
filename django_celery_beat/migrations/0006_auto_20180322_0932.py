@@ -10,7 +10,6 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('django_celery_beat', '0005_add_solarschedule_events_choices'),
-        ('django_celery_beat', '0006_auto_20180210_1226'),
     ]
 
     operations = [

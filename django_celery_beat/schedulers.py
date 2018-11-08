@@ -40,7 +40,7 @@ Cannot add entry %r to database schedule: %r. Contents: %r
 """
 
 logger = get_logger(__name__)
-debug, info, warning = logger.debug, logger.info, logger.warning
+debug, info = logger.debug, logger.info
 
 
 class ModelEntry(ScheduleEntry):
@@ -77,8 +77,7 @@ class ModelEntry(ScheduleEntry):
             self._disable(model)
 
         self.options = {}
-        for option in ['queue', 'exchange', 'routing_key', 'expires',
-                       'priority']:
+        for option in ['queue', 'exchange', 'routing_key', 'expires']:
             value = getattr(model, option)
             if value is None:
                 continue
@@ -98,25 +97,22 @@ class ModelEntry(ScheduleEntry):
 
     def is_due(self):
         if not self.model.enabled:
-            # 5 second delay for re-enable.
-            return schedules.schedstate(False, 5.0)
+            return False, 5.0   # 5 second delay for re-enable.
 
         # START DATE: only run after the `start_time`, if one exists.
         if self.model.start_time is not None:
             if maybe_make_aware(self._default_now()) < self.model.start_time:
                 # The datetime is before the start date - don't run.
                 _, delay = self.schedule.is_due(self.last_run_at)
-                # use original delay for re-check
-                return schedules.schedstate(False, delay)
+                return False, delay  # use original delay for re-check
 
         # ONE OFF TASK: Disable one off tasks after they've ran once
         if self.model.one_off and self.model.enabled \
                 and self.model.total_run_count > 0:
             self.model.enabled = False
             self.model.total_run_count = 0  # Reset
-            self.model.no_changes = False  # Mark the model entry as changed
             self.model.save()
-            return schedules.schedstate(False, None)  # Don't recheck
+            return False, None  # Don't recheck
 
         return self.schedule.is_due(self.last_run_at)
 
@@ -174,12 +170,11 @@ class ModelEntry(ScheduleEntry):
 
     @classmethod
     def _unpack_options(cls, queue=None, exchange=None, routing_key=None,
-                        priority=None, **kwargs):
+                        **kwargs):
         return {
             'queue': queue,
             'exchange': exchange,
             'routing_key': routing_key,
-            'priority': priority
         }
 
     def __repr__(self):
@@ -199,7 +194,6 @@ class DatabaseScheduler(Scheduler):
     _schedule = None
     _last_timestamp = None
     _initial_read = True
-    _heap_invalidated = False
 
     def __init__(self, *args, **kwargs):
         """Initialize the database scheduler."""
@@ -207,9 +201,9 @@ class DatabaseScheduler(Scheduler):
         Scheduler.__init__(self, *args, **kwargs)
         self._finalize = Finalize(self, self.sync, exitpriority=5)
         self.max_interval = (
-            kwargs.get('max_interval')
-            or self.app.conf.beat_max_loop_interval
-            or DEFAULT_MAX_INTERVAL)
+            kwargs.get('max_interval') or
+            self.app.conf.beat_max_loop_interval or
+            DEFAULT_MAX_INTERVAL)
 
     def setup_schedule(self):
         self.install_default_entries(self.schedule)
@@ -226,9 +220,8 @@ class DatabaseScheduler(Scheduler):
         return s
 
     def schedule_changed(self):
+        close_old_connections()
         try:
-            close_old_connections()
-
             # If MySQL is running with transaction isolation level
             # REPEATABLE-READ (default), then we won't see changes done by
             # other transactions until the current transaction is
@@ -242,13 +235,6 @@ class DatabaseScheduler(Scheduler):
         except DatabaseError as exc:
             logger.exception('Database gave error: %r', exc)
             return False
-        except InterfaceError:
-            warning(
-                'DatabaseScheduler: InterfaceError in schedule_changed(), '
-                'waiting to retry in next call...'
-            )
-            return False
-
         try:
             if ts and ts > (last if last else ts):
                 return True
@@ -266,27 +252,20 @@ class DatabaseScheduler(Scheduler):
     def sync(self):
         info('Writing entries...')
         _tried = set()
-        _failed = set()
         try:
             close_old_connections()
-
-            while self._dirty:
-                name = self._dirty.pop()
-                try:
-                    self.schedule[name].save()
-                    _tried.add(name)
-                except (KeyError, ObjectDoesNotExist) as exc:
-                    _failed.add(name)
-        except DatabaseError as exc:
+            with transaction.atomic():
+                while self._dirty:
+                    try:
+                        name = self._dirty.pop()
+                        _tried.add(name)
+                        self.schedule[name].save()
+                    except (KeyError, ObjectDoesNotExist):
+                        pass
+        except (DatabaseError, InterfaceError) as exc:
+            # retry later
+            self._dirty |= _tried
             logger.exception('Database error while sync: %r', exc)
-        except InterfaceError:
-            warning(
-                'DatabaseScheduler: InterfaceError in sync(), '
-                'waiting to retry in next call...'
-            )
-        finally:
-            # retry later, only for the failed ones
-            self._dirty |= _failed
 
     def update_from_dict(self, mapping):
         s = {}
@@ -314,12 +293,6 @@ class DatabaseScheduler(Scheduler):
             )
         self.update_from_dict(entries)
 
-    def schedules_equal(self, *args, **kwargs):
-        if self._heap_invalidated:
-            self._heap_invalidated = False
-            return False
-        return super(DatabaseScheduler, self).schedules_equal(*args, **kwargs)
-
     @property
     def schedule(self):
         initial = update = False
@@ -337,7 +310,6 @@ class DatabaseScheduler(Scheduler):
             # the schedule changed, invalidate the heap in Scheduler.tick
             if not initial:
                 self._heap = []
-                self._heap_invalidated = True
             if logger.isEnabledFor(logging.DEBUG):
                 debug('Current schedule:\n%s', '\n'.join(
                     repr(entry) for entry in values(self._schedule)),
